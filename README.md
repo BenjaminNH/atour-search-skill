@@ -1,99 +1,22 @@
-# Atour Collection
+# atour-search
 
-> 覆盖全国 31 省 / 262 城的亚朵酒店实时数据 · 非官方个人项目
-> <br>
-> 直接访问：https://lin-zecheng.github.io/Atour_Collection/
+亚朵酒店查询 Skill。无需登录，按城市和入住、离店日期，查询已开业门店的展示价、价格方案、开业时间和房型，用于协助规划行程。
 
+它不是亚朵官方产品，查询到价格为 App 未登录时的展示价，会与登录后的会员价有一定差距。
 
----
+## 让 Agent 安装
 
+把下面这段发给 Agent：
 
-
-## 项目特点
-
-- **即开即用，无需登录** — 默认空白 token（未登录状态）即可获取完整房价数据。
-
-- **全国实时比价** —逐店获取实时房价，覆盖 31 省 / 262 城。
-
-- **多维排序** — 按**开业时间**、价格、评分灵活排序。
-
-- **类型筛选** — 按酒店品牌类型（亚朵 / 亚朵 S / 亚朵 X / 亚朵轻居 / 亚朵见野）筛选。
-
-- **批量对比** — 多城市 / 多省份同时查询，自动去重合并。
-
-  
-
-## 网页展示
-
-![起始页](READEME/1.png)
-![起始页 · 省份范围](READEME/3.png)
-
-
-
-## Roadmap · 开发计划
-
-> 功能规划与待办事项
-
-### 功能
-
-- [ ] 加入酒店详情页面，查询所有房态
-- [ ] 支持地理位置TAG，便于查询指定位置周边环境
-- [ ] 加入酒店候选列表，可以多选酒店进行对比
-- [ ] 支持会员价格计算，按折扣比例进行计算
-- [ ] 支持输入个人会员token，获取精确价格（maybe）
-
-### 优化
-
-- [ ] 缩短查询加载时间
-- [ ] 修复气泡大量出现的卡顿问题
-
-
-
-
-
-## Quick Start
-
-```bash
-bash start.sh
+```text
+请安装这个 Skill。仓库是 https://github.com/BenjaminNH/atour-search-skill ，只安装其中的 atour-search 目录（里面有 SKILL.md），不要把整个仓库当作 Skill。
 ```
 
-首次启动自动安装依赖，无需手动配置。
+## 技术组成
 
-| 服务 | 地址 | 说明 |
-|------|------|------|
-| 起始页 | `http://localhost:4321` | 选择城市 / 省份与日期 |
-| 结果页 | `http://localhost:8501` | 地图 + 酒店对比列表 |
+- **语言**：Python 3.10+
+- **依赖**：`requests`，见 [atour-search/scripts/requirements.txt](atour-search/scripts/requirements.txt)
 
-停止服务：
+## 许可
 
-```bash
-bash stop.sh
-```
-
-
-
-## 配置（config.yaml）
-
-所有运行时参数集中在 `config.yaml`，修改后重启结果页生效：
-
-```yaml
-token:
-  atour_token: ""      # 留空 = 未登录模式（默认），无需会员凭证
-
-request:
-  list_delay:          # 列表请求随机节流区间（秒），越小越快、越易限流
-    min: 0.3
-    max: 0.5
-  light_delay:         # 详情等轻量请求随机节流区间（秒）
-    min: 0.25
-    max: 0.6
-  retry_backoff: 1.5   # 失败重试退避系数（秒）
-```
-
-> 被限流时适当调大延迟。亦可用环境变量 `ATOUR_CONFIG` 指定配置文件绝对路径。
-
-
-
-## 免责声明
-
-本项目为**个人学习研究**用途，**非**亚朵官方产品，亦不提供任何会员凭证。数据通过非官方接口获取，仅供参考。使用前请阅读 [DISCLAIMER.md](./DISCLAIMER.md) 并遵守相关法律法规。
+查询能力来自 [LIN-ZECHENG/Atour_Collection](https://github.com/LIN-ZECHENG/Atour_Collection)，MIT。许可见 [LICENSE](LICENSE)。使用前请阅读 [DISCLAIMER.md](DISCLAIMER.md)。

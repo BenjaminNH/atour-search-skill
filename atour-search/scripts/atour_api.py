@@ -2,75 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import random
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import Any
 
 import requests
-
-
-# 轻量 YAML 子集解析（纯标准库，不依赖 PyYAML）
-def _yaml_scalar(value: str) -> Any:
-    """把 yaml 标量字符串转成 Python 类型（int / float / bool / str）。"""
-    v = value.strip().strip("'\"")
-    if v in ("true", "True"):
-        return True
-    if v in ("false", "False"):
-        return False
-    if re.fullmatch(r"-?\d+", v):
-        return int(v)
-    if re.fullmatch(r"-?\d+\.\d+", v):
-        return float(v)
-    return v
-
-
-def _load_config(path: str | None = None) -> dict[str, Any]:
-    """从 yaml 文件加载配置（纯标准库解析）。"""
-    if path is None:
-        env_cfg = os.environ.get("ATOUR_CONFIG")
-        if env_cfg:
-            path = env_cfg
-        else:
-            here = os.path.dirname(os.path.abspath(__file__))
-            root = os.path.dirname(os.path.dirname(here))  # services/../.. → 项目根
-            path = os.path.join(root, "config.yaml")
-    if not os.path.isfile(path):
-        return {}
-
-    result: dict[str, Any] = {}
-    stack: list[tuple[int, dict[str, Any]]] = [(-1, result)]  # (缩进, 所在字典)
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.rstrip("\n")
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            indent = len(line) - len(line.lstrip(" "))
-            stripped = line.strip()
-            if ":" not in stripped:
-                continue
-            key, _, val = stripped.partition(":")
-            key = key.strip().strip("'\"")
-            val = val.strip()
-            # 弹出所有比当前更深（或同级更深）的栈顶
-            while len(stack) > 1 and indent <= stack[-1][0]:
-                stack.pop()
-            # 有值 → 标量节点；无值 → 进入子字典
-            if val:
-                stack[-1][1][key] = _yaml_scalar(val)
-            else:
-                child: dict[str, Any] = {}
-                stack[-1][1][key] = child
-                stack.append((indent, child))
-    return result
-
-
-_CONFIG = _load_config()
-_TOKEN_CFG = (_CONFIG.get("token") or {}).get("atour_token")
-_REQ_CFG = _CONFIG.get("request") or {}
 
 
 class AtourAPIError(RuntimeError):
@@ -101,25 +39,18 @@ _CHANNEL_ID = "20001"
 _PLAT_TYPE = "2"
 _CLIENT_ID = "34F12C8D-5917-4EF2-8FE9-702AB944CD44"
 
-ATOUR_TOKEN = _TOKEN_CFG if _TOKEN_CFG is not None else ""
+ATOUR_TOKEN = ""
+_LIST_DELAY = (0.3, 0.5)
+_LIGHT_DELAY = (0.25, 0.6)
+_RETRY_BACKOFF = 1.5
 
 
 def _request_delay() -> None:
-    d = _REQ_CFG.get("list_delay") if _REQ_CFG.get("list_delay") is not None else {}
-    _min = float(d.get("min", 0.3))
-    _max = float(d.get("max", 0.5))
-    if _min <= 0 and _max <= 0:
-        return
-    time.sleep(random.uniform(_min, _max))
+    time.sleep(random.uniform(*_LIST_DELAY))
 
 
 def _request_delay_light() -> None:
-    d = _REQ_CFG.get("light_delay") if _REQ_CFG.get("light_delay") is not None else {}
-    _min = float(d.get("min", 0.25))
-    _max = float(d.get("max", 0.6))
-    if _min <= 0 and _max <= 0:
-        return
-    time.sleep(random.uniform(_min, _max))
+    time.sleep(random.uniform(*_LIGHT_DELAY))
 
 
 _CITY_API = "https://api2.yaduo.com/atourlife/city/listOfChain"
@@ -138,6 +69,7 @@ PROVINCE_ID_NAME = {
 
 _CITY_CACHE: dict[str, list[str]] | None = None
 _OPEN_DATE_CACHE: dict[str, str] = {}
+_PHONE_CACHE: dict[str, str] = {}
 _ROOM_CACHE: dict[tuple, list[dict[str, Any]]] = {}
 
 
@@ -238,12 +170,16 @@ def _fetch_open_date(chain_id: object, token: str) -> str:
         payload = resp.json()
     except requests.RequestException:
         _OPEN_DATE_CACHE[key] = "—"
+        _PHONE_CACHE[key] = ""
         return "—"
     if not payload.get("success", True):
         _OPEN_DATE_CACHE[key] = "—"
+        _PHONE_CACHE[key] = ""
         return "—"
     base = (payload.get("result") or {}).get("chainBase") or {}
     _OPEN_DATE_CACHE[key] = base.get("openDate") or "—"
+    # 同一次 chainDetailBase 响应里的电话。列表接口通常没有这列。
+    _PHONE_CACHE[key] = str(base.get("phoneNum") or "").strip()
     return _OPEN_DATE_CACHE[key]
 
 
@@ -387,16 +323,14 @@ def _query_chain(city_full: str, start_date: date, end_date: date, token: str, m
                     code = payload.get("code")
                     msg = payload.get("msg_code") or payload.get("msg") or payload.get("message")
                     raise AtourAPIError(
-                        f"亚朵接口返回错误：code={code} msg={msg}。"
-                        f"若需登录态请更新 config.yaml 中的 token；若为限流请稍后重试。"
+                        f"亚朵接口返回错误：code={code} msg={msg}。若为限流请稍后重试。"
                     )
                 last_exc = None
                 break
             except (requests.RequestException, AtourAPIError) as exc:
                 last_exc = exc
                 if attempt < 2:
-                    _backoff = float(_REQ_CFG.get("retry_backoff", 1.5))
-                    time.sleep(_backoff * (attempt + 1))
+                    time.sleep(_RETRY_BACKOFF * (attempt + 1))
                     continue
                 raise
         if last_exc is not None:
@@ -430,9 +364,13 @@ def _normalize_hotel(h: dict[str, Any]) -> dict[str, Any]:
     comment_count = _to_int(h.get("judgementCount") or h.get("commentCount") or h.get("commentNum"))
     distance_km = _to_float(h.get("distance") or h.get("distanceKm") or h.get("distanceKM"))
     original_price = _to_float(h.get("marketPrice") or h.get("originalPrice"))
+    price_tag = h.get("priceTag")
+    if isinstance(price_tag, list):
+        price_tag = " / ".join(str(x) for x in price_tag if x)
+    rate_name = h.get("rateCodeName") or price_tag or ""
     discount_text = (
         h.get("discountText") or h.get("priceWithCouponDesc")
-        or h.get("couponText") or h.get("priceTag") or ""
+        or h.get("couponText") or price_tag or ""
     )
     return {
         "酒店名称": h.get("name", ""),
@@ -440,7 +378,10 @@ def _normalize_hotel(h: dict[str, Any]) -> dict[str, Any]:
         "开业时间": "—",
 
         "位置": h.get("chainArea") or h.get("cityName") or "",
+        "地址": (h.get("address") or "").strip(),
         "地段/商圈": h.get("nearBusiness") or h.get("chainArea") or "",
+        "距离说明": (h.get("distanceInfo") or "").strip(),
+        "价格方案": str(rate_name).strip(),
         "房型": "—",
         "铂金会员价": float(member) if member is not None else None,
         "是否有房": "满房" if full else "有房",
@@ -556,33 +497,39 @@ def fetch_atour_prices(
         records = _query_chain(loc, start_date, end_date, token, on_page=_emit_city)
 
     if enrich_open_date and records:
-        seen_id: set[str] = set()
-        unique_records: list[dict[str, Any]] = []
-        for r in records:
-            cid = r.get("chainId")
-            if not cid or cid in seen_id:
-                continue
-            seen_id.add(cid)
-            unique_records.append(r)
-        total_unique = len(unique_records)
-
-        def _enrich_one(idx_r):
-            idx, r = idx_r
-            cid = r["chainId"]
-            open_date = _fetch_open_date(cid, token)
-            return idx, open_date
-
-        done = 0
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {executor.submit(_enrich_one, (i, r)): i for i, r in enumerate(unique_records)}
-            for future in as_completed(futures):
-                idx, open_date = future.result()
-                unique_records[idx]["开业时间"] = open_date
-                done += 1
-                if on_progress is not None and (done % 5 == 0 or done == total_unique):
-                    on_progress(records, f"补全开业时间：{done}/{total_unique} 家…")
+        enrich_open_dates(records, token, on_progress=on_progress)
 
     return records
+
+
+def enrich_open_dates(records: list[dict[str, Any]], token: str = ATOUR_TOKEN, on_progress=None) -> None:
+    """按 chainId 补全开业时间，并带上同一次详情里的电话。原地修改 records。"""
+    seen_id: set[str] = set()
+    unique_records: list[dict[str, Any]] = []
+    for r in records:
+        cid = r.get("chainId")
+        if not cid or cid in seen_id:
+            continue
+        seen_id.add(cid)
+        unique_records.append(r)
+    total_unique = len(unique_records)
+
+    def _enrich_one(idx_r):
+        idx, r = idx_r
+        cid = r["chainId"]
+        open_date = _fetch_open_date(cid, token)
+        return idx, open_date
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_enrich_one, (i, r)): i for i, r in enumerate(unique_records)}
+        for future in as_completed(futures):
+            idx, open_date = future.result()
+            unique_records[idx]["开业时间"] = open_date
+            unique_records[idx]["电话"] = _PHONE_CACHE.get(str(unique_records[idx].get("chainId")), "")
+            done += 1
+            if on_progress is not None and (done % 5 == 0 or done == total_unique):
+                on_progress(records, f"补全开业时间：{done}/{total_unique} 家…")
 
 
 def _safe_province_cities(token: str) -> dict[str, list[str]]:
