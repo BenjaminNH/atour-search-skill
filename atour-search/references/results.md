@@ -79,7 +79,7 @@
 
 `rooms_status` 为 `ok` 时还有 `room_summary`：`sellable_count`、`sold_out_count`、`all_sold_out`、`lowest_returned`、`lowest_sellable`。后两项是 `{name, display_price, sold_out, bookable}`，没有对应房型时为 null。`lowest_returned` 是返回结果里的最低价，满房也保留。`lowest_sellable` 是当前可订的最低价。
 
-房型展示价和列表展示价来自同一类 App 价格。读法与该响应里的 `price_note` 相同。`rooms_status` 为 `ok`、`empty`、`error`、`blocked`、`rate_limited`、`http_error` 或 `network_error`。`empty` 是请求成功但没有房型，退出码为 0。其余失败状态退出码为 1，`ok` 为 false，`rooms` 为 []，不能当成没房。`blocked` 表示短时间查看的房型详情太多，同一轮后续报价不再发请求。`rate_limited` 和服务器错误、超时最多再试 2 次，间隔 1.5 秒、3 秒。
+房型展示价和列表展示价来自同一类 App 价格。读法与该响应里的 `price_note` 相同。`rooms_status` 为 `ok`、`empty`、`error`、`blocked`、`rate_limited`、`http_error` 或 `network_error`。`empty` 是请求成功但没有房型，退出码为 0。其余失败状态退出码为 1，`ok` 为 false，`rooms` 为 []，不能当成没房。每次房型报价前随机等待 3 到 5 秒。`blocked` 和 `rate_limited` 表示查看房型详情触发了限制，这次不重试，同一轮后续报价也不再发请求。服务器错误和超时最多再试 2 次，间隔 1.5 秒、3 秒。
 
 ## 退出码
 

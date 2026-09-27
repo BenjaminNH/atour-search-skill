@@ -101,7 +101,7 @@ class _HttpResponse:
 class RoomsResultTests(unittest.TestCase):
     def setUp(self):
         _clear_caches()
-        patch.object(atour_api, "_request_delay_light").start()
+        patch.object(atour_api, "_request_delay_quote").start()
         self.sleep = patch.object(atour_api.time, "sleep").start()
         self.post = patch.object(atour_api.requests, "post").start()
         self.addCleanup(patch.stopall)
@@ -166,23 +166,28 @@ class RoomsResultTests(unittest.TestCase):
         self.assertEqual(self.sleep.call_count, 0)
         self.assertNotIn(("31", str(stay[0]), str(stay[1])), atour_api._ROOM_CACHE)
 
-    def test_429_and_5xx_retry_then_stop(self):
+    def test_429_stops_without_retry(self):
         stay = date(2026, 9, 28), date(2026, 9, 29)
         self.post.return_value = _HttpResponse(429, "")
         limited = atour_api.fetch_rooms_result(33, *stay)
         self.assertEqual(limited["status"], "rate_limited")
         self.assertEqual(limited["rooms"], [])
-        self.assertEqual(self.post.call_count, 3)
-        self.assertEqual([item.args[0] for item in self.sleep.call_args_list], [1.5, 3.0])
+        self.assertNotEqual(limited["status"], "empty")
+        again = atour_api.fetch_rooms_result(34, *stay)
+        self.assertEqual(again["status"], "blocked")
+        self.assertEqual(self.post.call_count, 1)
+        self.assertEqual(self.sleep.call_count, 0)
         self.assertNotIn(("33", str(stay[0]), str(stay[1])), atour_api._ROOM_CACHE)
 
-        self.sleep.reset_mock()
+    def test_5xx_retries_then_stops(self):
+        stay = date(2026, 9, 28), date(2026, 9, 29)
         self.post.return_value = _HttpResponse(503, "upstream")
-        server = atour_api.fetch_rooms_result(34, *stay)
+        server = atour_api.fetch_rooms_result(37, *stay)
         self.assertEqual(server["status"], "http_error")
         self.assertIn("HTTP 503", server["error"])
-        self.assertEqual(self.post.call_count, 6)
+        self.assertEqual(self.post.call_count, 3)
         self.assertEqual([item.args[0] for item in self.sleep.call_args_list], [1.5, 3.0])
+        self.assertNotIn(("37", str(stay[0]), str(stay[1])), atour_api._ROOM_CACHE)
 
     def test_timeout_is_network_error_and_client_4xx_is_not_retried(self):
         stay = date(2026, 9, 28), date(2026, 9, 29)

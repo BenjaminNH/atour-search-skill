@@ -42,6 +42,7 @@ _CLIENT_ID = "34F12C8D-5917-4EF2-8FE9-702AB944CD44"
 ATOUR_TOKEN = ""
 _LIST_DELAY = (0.3, 0.5)
 _LIGHT_DELAY = (0.25, 0.6)
+_QUOTE_DELAY = (3, 5)
 _RETRY_BACKOFF = 1.5
 _QUOTE_ATTEMPTS = 3
 _QUOTE_BLOCKED = False
@@ -53,6 +54,10 @@ def _request_delay() -> None:
 
 def _request_delay_light() -> None:
     time.sleep(random.uniform(*_LIGHT_DELAY))
+
+
+def _request_delay_quote() -> None:
+    time.sleep(random.uniform(*_QUOTE_DELAY))
 
 
 def _success_rejected(payload: dict) -> bool:
@@ -262,7 +267,7 @@ def fetch_rooms_result(chain_id: object, start_date: date, end_date: date, token
         if attempt:
             time.sleep(_RETRY_BACKOFF * attempt)
         else:
-            _request_delay_light()
+            _request_delay_quote()
         try:
             resp = requests.post(_QUOTE_API, params=params, headers=_build_headers(token), json=body, timeout=15)
         except requests.Timeout:
@@ -276,8 +281,8 @@ def fetch_rooms_result(chain_id: object, start_date: date, end_date: date, token
             _QUOTE_BLOCKED = True
             return _rooms_failure("blocked", "查看的房型详情太多，暂时不能继续")
         if http_status == "rate_limited":
-            failure = _rooms_failure("rate_limited", "房型报价暂时过于频繁")
-            continue
+            _QUOTE_BLOCKED = True
+            return _rooms_failure("rate_limited", "房型报价暂时过于频繁")
         if http_status == "http_error":
             code = getattr(resp, "status_code", 0) or 0
             failure = _rooms_failure("http_error", f"房型报价请求失败：HTTP {code}")
