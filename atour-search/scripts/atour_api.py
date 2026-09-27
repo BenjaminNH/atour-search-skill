@@ -53,6 +53,11 @@ def _request_delay_light() -> None:
     time.sleep(random.uniform(*_LIGHT_DELAY))
 
 
+def _success_rejected(payload: dict) -> bool:
+    # 缺省或 null 仍视为成功。报价接口有时 success 为 null，同时带有房型。
+    return payload.get("success", True) is False
+
+
 _CITY_API = "https://api2.yaduo.com/atourlife/city/listOfChain"
 _DETAIL_API = "https://api2.yaduo.com/atourlife/chain/chainDetailBase"
 _QUOTE_API = "https://api2.yaduo.com/atourlife/chain/chainDetailQuote"
@@ -71,6 +76,7 @@ _CITY_CACHE: dict[str, list[str]] | None = None
 _OPEN_DATE_CACHE: dict[str, str] = {}
 _PHONE_CACHE: dict[str, str] = {}
 _ROOM_CACHE: dict[tuple, list[dict[str, Any]]] = {}
+_CHAIN_BASE_CACHE: dict[str, dict[str, Any]] = {}
 
 
 _AUTONOMOUS = {
@@ -146,11 +152,12 @@ def get_atour_cities(token: str = ATOUR_TOKEN, force: bool = False) -> dict[str,
     return grouped
 
 
-def _fetch_open_date(chain_id: object, token: str) -> str:
-    """按 chainId 取酒店开业时间。"""
+def fetch_chain_base(chain_id: object, token: str = ATOUR_TOKEN) -> dict[str, Any]:
+    """按 chainId 取开业时间与电话，并标明成功、缺失或失败。"""
     key = str(chain_id)
-    if key in _OPEN_DATE_CACHE:
-        return _OPEN_DATE_CACHE[key]
+    cached = _CHAIN_BASE_CACHE.get(key)
+    if cached is not None:
+        return cached
     _request_delay_light()
     params = {
         "platType": _PLAT_TYPE,
@@ -168,26 +175,52 @@ def _fetch_open_date(chain_id: object, token: str) -> str:
         )
         resp.raise_for_status()
         payload = resp.json()
-    except requests.RequestException:
-        _OPEN_DATE_CACHE[key] = "—"
-        _PHONE_CACHE[key] = ""
-        return "—"
-    if not payload.get("success", True):
-        _OPEN_DATE_CACHE[key] = "—"
-        _PHONE_CACHE[key] = ""
-        return "—"
+    except requests.RequestException as exc:
+        return {
+            "status": "error",
+            "open_date": "",
+            "phone": "",
+            "error": f"开业时间接口请求失败：{exc}",
+        }
+    if _success_rejected(payload):
+        code = payload.get("code")
+        msg = payload.get("msg_code") or payload.get("msg") or payload.get("message")
+        return {
+            "status": "error",
+            "open_date": "",
+            "phone": "",
+            "error": f"开业时间接口返回错误：code={code} msg={msg}",
+        }
     base = (payload.get("result") or {}).get("chainBase") or {}
-    _OPEN_DATE_CACHE[key] = base.get("openDate") or "—"
+    open_value = base.get("openDate")
+    open_text = "" if open_value is None else str(open_value)
     # 同一次 chainDetailBase 响应里的电话。列表接口通常没有这列。
-    _PHONE_CACHE[key] = str(base.get("phoneNum") or "").strip()
-    return _OPEN_DATE_CACHE[key]
+    phone = str(base.get("phoneNum") or "").strip()
+    if open_text.strip():
+        result = {"status": "ok", "open_date": open_text, "phone": phone, "error": ""}
+        _OPEN_DATE_CACHE[key] = open_text
+    else:
+        result = {"status": "missing", "open_date": "", "phone": phone, "error": ""}
+        _OPEN_DATE_CACHE[key] = "—"
+    _PHONE_CACHE[key] = phone
+    _CHAIN_BASE_CACHE[key] = result
+    return result
 
 
-def get_hotel_rooms(chain_id: object, start_date: date, end_date: date, token: str = ATOUR_TOKEN) -> list[dict[str, Any]]:
-    """按 chainId 取某酒店在指定日期内的全部房型与价格。"""
+def _fetch_open_date(chain_id: object, token: str) -> str:
+    """按 chainId 取酒店开业时间。"""
+    result = fetch_chain_base(chain_id, token)
+    if result["status"] == "ok":
+        return result["open_date"]
+    return "—"
+
+
+def fetch_rooms_result(chain_id: object, start_date: date, end_date: date, token: str = ATOUR_TOKEN) -> dict[str, Any]:
+    """按 chainId 取房型报价，并标明成功、空列表或失败。"""
     key = (str(chain_id), str(start_date), str(end_date))
     if key in _ROOM_CACHE:
-        return _ROOM_CACHE[key]
+        rooms = _ROOM_CACHE[key]
+        return {"status": "ok" if rooms else "empty", "rooms": rooms, "error": ""}
     _request_delay_light()
     params = {
         "platType": _PLAT_TYPE,
@@ -208,12 +241,16 @@ def get_hotel_rooms(chain_id: object, start_date: date, end_date: date, token: s
         resp = requests.post(_QUOTE_API, params=params, headers=_build_headers(token), json=body, timeout=15)
         resp.raise_for_status()
         payload = resp.json()
-    except requests.RequestException:
-        _ROOM_CACHE[key] = []
-        return []
-    if not payload.get("success", True):
-        _ROOM_CACHE[key] = []
-        return []
+    except requests.RequestException as exc:
+        return {"status": "error", "rooms": [], "error": f"房型接口请求失败：{exc}"}
+    if _success_rejected(payload):
+        code = payload.get("code")
+        msg = payload.get("msg_code") or payload.get("msg") or payload.get("message")
+        return {
+            "status": "error",
+            "rooms": [],
+            "error": f"房型接口返回错误：code={code} msg={msg}",
+        }
     price_resp = (payload.get("result") or {}).get("priceResponse") or {}
     raw_rooms = price_resp.get("chainRoomList", []) or []
     out: list[dict[str, Any]] = []
@@ -231,7 +268,12 @@ def get_hotel_rooms(chain_id: object, start_date: date, end_date: date, token: s
             "是否满房": "满房" if mp.get("isFullRoom") else "有房",
         })
     _ROOM_CACHE[key] = out
-    return out
+    return {"status": "ok" if raw_rooms else "empty", "rooms": out, "error": ""}
+
+
+def get_hotel_rooms(chain_id: object, start_date: date, end_date: date, token: str = ATOUR_TOKEN) -> list[dict[str, Any]]:
+    """按 chainId 取某酒店在指定日期内的全部房型与价格。"""
+    return fetch_rooms_result(chain_id, start_date, end_date, token)["rooms"]
 
 
 def _lowest_room_types(chain_id: object, start_date: date, end_date: date, token: str) -> str:
@@ -379,6 +421,7 @@ def _normalize_hotel(h: dict[str, Any]) -> dict[str, Any]:
 
         "位置": h.get("chainArea") or h.get("cityName") or "",
         "地址": (h.get("address") or "").strip(),
+        "到店说明": str(h.get("mapRemark") or "").strip(),
         "地段/商圈": h.get("nearBusiness") or h.get("chainArea") or "",
         "距离说明": (h.get("distanceInfo") or "").strip(),
         "价格方案": str(rate_name).strip(),
@@ -516,17 +559,19 @@ def enrich_open_dates(records: list[dict[str, Any]], token: str = ATOUR_TOKEN, o
 
     def _enrich_one(idx_r):
         idx, r = idx_r
-        cid = r["chainId"]
-        open_date = _fetch_open_date(cid, token)
-        return idx, open_date
+        return idx, fetch_chain_base(r["chainId"], token)
 
     done = 0
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(_enrich_one, (i, r)): i for i, r in enumerate(unique_records)}
         for future in as_completed(futures):
-            idx, open_date = future.result()
-            unique_records[idx]["开业时间"] = open_date
-            unique_records[idx]["电话"] = _PHONE_CACHE.get(str(unique_records[idx].get("chainId")), "")
+            idx, detail = future.result()
+            rec = unique_records[idx]
+            status = detail["status"]
+            rec["开业时间"] = detail["open_date"] if status == "ok" else "—"
+            rec["电话"] = detail["phone"]
+            rec["开业状态"] = status
+            rec["详情错误"] = detail["error"]
             done += 1
             if on_progress is not None and (done % 5 == 0 or done == total_unique):
                 on_progress(records, f"补全开业时间：{done}/{total_unique} 家…")

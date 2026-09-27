@@ -19,8 +19,8 @@ from atour_api import (
     AtourAPIError,
     enrich_open_dates,
     fetch_atour_prices,
+    fetch_rooms_result,
     get_atour_cities,
-    get_hotel_rooms,
 )
 
 
@@ -30,7 +30,7 @@ _PRICE_NOTE = (
     "不需要配置 token。"
     "display_price 是未登录状态下亚朵 App 的展示价，"
     "常见 price_plan 是「注册会员立付立减价」或「开业特惠」，也会出现其他方案。"
-    "它和登录后的金卡或铂金个人价会有细微差别。"
+    "会与登录后的会员价有一定差距。"
     "market_price 是门市价。"
     "open_date 是酒店开业时间，常见到月份，例如「2024年8月开业」。"
     "price_plan 里的「开业特惠」不是开业时间。"
@@ -39,8 +39,14 @@ _PRICE_NOTE = (
 _ROOM_PRICE_NOTE = (
     "不需要配置 token。"
     "display_price 是该房型在未登录状态下的 App 展示价，读法和酒店列表相同。"
-    "它和登录后的金卡或铂金个人价会有细微差别。"
+    "会与登录后的会员价有一定差距。"
     "market_price 是门市价。这里不下单。"
+)
+_PRICE_SOURCE = "logged_out_app_display"
+_ACCESS_HINT = (
+    "地铁和到店路线可能写在 address 或 access_note，两处都要读。"
+    "原文没写地铁只表示没提到。"
+    "distance_text 是距市中心的直线距离。程序不挑选站点和距离。"
 )
 
 
@@ -99,6 +105,78 @@ def _keep_brand(row: dict[str, Any], brand: str) -> bool:
     return brand in kind or brand in name
 
 
+def _brand_terms(groups: list[list[str]] | None) -> list[str]:
+    terms: list[str] = []
+    for group in groups or []:
+        for item in group:
+            text = str(item).strip()
+            if text:
+                terms.append(text)
+    return terms
+
+
+def _matches_any_brand(row: dict[str, Any], terms: list[str]) -> bool:
+    return any(_keep_brand(row, term) for term in terms)
+
+
+def _member_price(row: dict[str, Any]) -> float | None:
+    value = row.get("铂金会员价")
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _price_within_cap(row: dict[str, Any], max_price: float) -> bool:
+    price = _member_price(row)
+    if price is None:
+        return False
+    return price <= max_price
+
+
+def _queried_at() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _apply_available_only(
+    rows: list[dict[str, Any]],
+    check_in: date,
+    check_out: date,
+) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("是否有房") != "满房":
+            row["_availability_from"] = "list"
+            row["_rooms_error"] = ""
+            kept.append(row)
+            continue
+        result = fetch_rooms_result(row.get("chainId"), check_in, check_out)
+        status = result.get("status")
+        if status == "error":
+            row["_availability_from"] = "rooms_error"
+            row["_rooms_error"] = str(result.get("error") or "")
+            kept.append(row)
+            continue
+        rooms = result.get("rooms") or []
+        if status == "ok" and any(room.get("是否满房") != "满房" for room in rooms):
+            row["是否有房"] = "有房"
+            row["_availability_from"] = "rooms"
+            row["_rooms_error"] = ""
+            kept.append(row)
+            continue
+        if status in ("empty", "ok"):
+            continue
+        row["_availability_from"] = "rooms_error"
+        row["_rooms_error"] = str(result.get("error") or "")
+        kept.append(row)
+    return kept
+
+
 def _dedupe(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[object] = set()
     kept: list[dict[str, Any]] = []
@@ -116,11 +194,25 @@ def _hotel_record(row: dict[str, Any], with_distance: bool) -> dict[str, Any]:
     open_date = _text(row.get("开业时间"))
     if open_date == "—":
         open_date = ""
+    open_status = row.get("开业状态")
+    if open_status not in ("ok", "missing", "error"):
+        open_status = "ok" if open_date else "missing"
+    open_error = ""
+    if open_status == "error":
+        detail = row.get("详情错误")
+        open_error = "" if detail is None else str(detail)
+    availability_from = row.get("_availability_from") or "list"
+    if availability_from not in ("list", "rooms", "rooms_error"):
+        availability_from = "list"
+    rooms_error = str(row.get("_rooms_error") or "") if availability_from == "rooms_error" else ""
+    note = row.get("到店说明")
+    access_note = "" if note is None else str(note)
     record: dict[str, Any] = {
         "chain_id": row.get("chainId"),
         "name": _text(row.get("酒店名称")),
         "brand": _text(row.get("酒店类型")),
         "address": _text(row.get("地址")),
+        "access_note": access_note,
         "area": _text(row.get("位置")),
         "business_area": _text(row.get("地段/商圈")),
         "latitude": row.get("latitude"),
@@ -131,10 +223,14 @@ def _hotel_record(row: dict[str, Any], with_distance: bool) -> dict[str, Any]:
         "market_price": _num(row.get("门市价")),
         "price_plan": _text(row.get("价格方案")),
         "available": row.get("是否有房") != "满房",
+        "availability_from": availability_from,
+        "rooms_error": rooms_error,
         "score": _num(row.get("评分")),
         "review_count": _num(row.get("点评数")),
         "cover_url": row.get("封面图") or "",
         "open_date": open_date,
+        "open_date_status": open_status,
+        "open_date_error": open_error,
         "phone": _text(row.get("电话")),
     }
     if with_distance:
@@ -204,6 +300,8 @@ def _search(args: argparse.Namespace) -> int:
         return _emit({"ok": False, "error": "radius-km 需要和 near-lat、near-lng 一起使用"}, 2)
     if args.limit is not None and args.limit < 1:
         return _emit({"ok": False, "error": "limit 需要是正整数"}, 2)
+    if args.max_price is not None and args.max_price < 0:
+        return _emit({"ok": False, "error": "max-price 需要是非负数"}, 2)
     origin = (args.near_lat, args.near_lng) if args.near_lat is not None else None
     sort = args.sort or ("distance" if origin else "price")
     if sort == "distance" and origin is None:
@@ -223,8 +321,14 @@ def _search(args: argparse.Namespace) -> int:
         return _emit({"ok": False, "error": str(exc)}, 1)
 
     rows = _dedupe(rows)
-    if args.brand:
-        rows = [row for row in rows if _keep_brand(row, args.brand.strip())]
+    brands = _brand_terms(args.brand)
+    exclude_brands = _brand_terms(args.exclude_brand)
+    if brands:
+        rows = [row for row in rows if _matches_any_brand(row, brands)]
+    if exclude_brands:
+        rows = [row for row in rows if not _matches_any_brand(row, exclude_brands)]
+    if args.max_price is not None:
+        rows = [row for row in rows if _price_within_cap(row, args.max_price)]
     if origin:
         for row in rows:
             lat, lng = row.get("latitude"), row.get("longitude")
@@ -237,6 +341,8 @@ def _search(args: argparse.Namespace) -> int:
                 row for row in rows
                 if row.get("_distance_km") is not None and row["_distance_km"] <= args.radius_km
             ]
+    if args.available_only:
+        rows = _apply_available_only(rows, args.check_in, args.check_out)
     if rows:
         enrich_open_dates(rows)
 
@@ -245,13 +351,17 @@ def _search(args: argparse.Namespace) -> int:
     if args.limit is not None:
         hotels = hotels[: args.limit]
     missing = sum(1 for hotel in hotels if not hotel["open_date"])
+    open_errors = sum(1 for hotel in hotels if hotel.get("open_date_status") == "error")
     return _emit({
         "ok": True,
         "query": {
             "city": args.city,
             "check_in": args.check_in.isoformat(),
             "check_out": args.check_out.isoformat(),
-            "brand": args.brand or "",
+            "brand": brands,
+            "exclude_brand": exclude_brands,
+            "max_price": args.max_price,
+            "available_only": bool(args.available_only),
             "near": {"latitude": origin[0], "longitude": origin[1]} if origin else None,
             "radius_km": args.radius_km,
             "sort": sort,
@@ -259,6 +369,10 @@ def _search(args: argparse.Namespace) -> int:
         },
         "count": len(hotels),
         "open_date_missing": missing,
+        "open_date_errors": open_errors,
+        "queried_at": _queried_at(),
+        "price_source": _PRICE_SOURCE,
+        "access_hint": _ACCESS_HINT,
         "price_note": _PRICE_NOTE,
         "hotels": hotels,
     })
@@ -268,19 +382,31 @@ def _rooms(args: argparse.Namespace) -> int:
     if args.check_in >= args.check_out:
         return _emit({"ok": False, "error": "退房日期必须晚于入住日期"}, 2)
     chain_id: object = int(args.chain_id) if str(args.chain_id).isdigit() else args.chain_id
-    rooms = get_hotel_rooms(chain_id, args.check_in, args.check_out)
-    return _emit({
-        "ok": True,
+    result = fetch_rooms_result(chain_id, args.check_in, args.check_out)
+    status = result.get("status")
+    if status not in ("ok", "empty", "error"):
+        status = "error"
+    public = [_room_record(room) for room in (result.get("rooms") or [])] if status == "ok" else []
+    payload: dict[str, Any] = {
+        "ok": status != "error",
+        "rooms_status": status,
         "chain_id": chain_id,
         "check_in": args.check_in.isoformat(),
         "check_out": args.check_out.isoformat(),
-        "count": len(rooms),
+        "count": len(public),
+        "queried_at": _queried_at(),
+        "price_source": _PRICE_SOURCE,
         "price_note": _ROOM_PRICE_NOTE,
-        "rooms": [_room_record(room) for room in rooms],
-    })
+        "rooms": public,
+    }
+    if status == "error":
+        payload["error"] = str(result.get("error") or "")
+        return _emit(payload, 1)
+    return _emit(payload, 0)
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(description="查询亚朵酒店，向标准输出打印 JSON")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -292,7 +418,20 @@ def main(argv: list[str] | None = None) -> int:
     search.add_argument("--city", required=True, help="一个城市，例如 杭州 或 杭州市")
     search.add_argument("--check-in", required=True, type=_parse_date)
     search.add_argument("--check-out", required=True, type=_parse_date)
-    search.add_argument("--brand", default="", help="品牌或名称片段，例如 轻居、亚朵X、亚朵S")
+    search.add_argument(
+        "--brand",
+        action="append",
+        nargs="+",
+        help="只保留这些品牌，可重复或一次写多个。六个正式品牌名按相等匹配",
+    )
+    search.add_argument(
+        "--exclude-brand",
+        action="append",
+        nargs="+",
+        help="排除这些品牌，可重复或一次写多个，匹配规则与 --brand 相同",
+    )
+    search.add_argument("--max-price", type=float, help="只保留展示价小于等于该值的酒店，没有展示价的不保留")
+    search.add_argument("--available-only", action="store_true", help="列表显示满房时再查房型，两边都没有可售房才去掉")
     search.add_argument("--near-lat", type=float, help="周边圆心纬度，国测局坐标 GCJ-02")
     search.add_argument("--near-lng", type=float, help="周边圆心经度，国测局坐标 GCJ-02")
     search.add_argument("--radius-km", type=float, help="只保留直线距离以内的店，并在查开业时间前生效")
@@ -311,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
     rooms.add_argument("--check-out", required=True, type=_parse_date)
     rooms.set_defaults(func=_rooms)
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
     return args.func(args)
 
 
