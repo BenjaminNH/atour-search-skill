@@ -143,6 +143,18 @@ def _queried_at() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+_ROOM_LOOKUP_FAILURES = {"error", "blocked", "rate_limited", "http_error", "network_error"}
+
+
+def _mark_rooms_unconfirmed(row: dict[str, Any], result: dict[str, Any]) -> None:
+    status = str(result.get("status") or "error")
+    if status not in _ROOM_LOOKUP_FAILURES:
+        status = "error"
+    row["_availability_from"] = "rooms_error"
+    row["_rooms_error"] = str(result.get("error") or "")
+    row["_rooms_error_status"] = status
+
+
 def _apply_available_only(
     rows: list[dict[str, Any]],
     check_in: date,
@@ -153,13 +165,13 @@ def _apply_available_only(
         if row.get("是否有房") != "满房":
             row["_availability_from"] = "list"
             row["_rooms_error"] = ""
+            row["_rooms_error_status"] = ""
             kept.append(row)
             continue
         result = fetch_rooms_result(row.get("chainId"), check_in, check_out)
         status = result.get("status")
-        if status == "error":
-            row["_availability_from"] = "rooms_error"
-            row["_rooms_error"] = str(result.get("error") or "")
+        if status in _ROOM_LOOKUP_FAILURES:
+            _mark_rooms_unconfirmed(row, result)
             kept.append(row)
             continue
         rooms = result.get("rooms") or []
@@ -167,12 +179,12 @@ def _apply_available_only(
             row["是否有房"] = "有房"
             row["_availability_from"] = "rooms"
             row["_rooms_error"] = ""
+            row["_rooms_error_status"] = ""
             kept.append(row)
             continue
         if status in ("empty", "ok"):
             continue
-        row["_availability_from"] = "rooms_error"
-        row["_rooms_error"] = str(result.get("error") or "")
+        _mark_rooms_unconfirmed(row, result)
         kept.append(row)
     return kept
 
@@ -205,6 +217,7 @@ def _hotel_record(row: dict[str, Any], with_distance: bool) -> dict[str, Any]:
     if availability_from not in ("list", "rooms", "rooms_error"):
         availability_from = "list"
     rooms_error = str(row.get("_rooms_error") or "") if availability_from == "rooms_error" else ""
+    rooms_error_status = str(row.get("_rooms_error_status") or "") if availability_from == "rooms_error" else ""
     note = row.get("到店说明")
     access_note = "" if note is None else str(note)
     record: dict[str, Any] = {
@@ -225,6 +238,7 @@ def _hotel_record(row: dict[str, Any], with_distance: bool) -> dict[str, Any]:
         "available": row.get("是否有房") != "满房",
         "availability_from": availability_from,
         "rooms_error": rooms_error,
+        "rooms_error_status": rooms_error_status,
         "score": _num(row.get("评分")),
         "review_count": _num(row.get("点评数")),
         "cover_url": row.get("封面图") or "",
@@ -239,6 +253,7 @@ def _hotel_record(row: dict[str, Any], with_distance: bool) -> dict[str, Any]:
 
 
 def _room_record(room: dict[str, Any]) -> dict[str, Any]:
+    sold_out = room.get("是否满房") == "满房"
     return {
         "name": _text(room.get("房型")),
         "display_price": _num(room.get("铂金会员价")),
@@ -246,8 +261,44 @@ def _room_record(room: dict[str, Any]) -> dict[str, Any]:
         "breakfast": room.get("早餐数"),
         "cancel_policy": _text(room.get("取消政策")),
         "min_nights": room.get("最少入住晚数"),
-        "sold_out": room.get("是否满房") == "满房",
+        "sold_out": sold_out,
+        "bookable": not sold_out,
     }
+
+
+def _room_summary(rooms: list[dict[str, Any]]) -> dict[str, Any]:
+    def pack(room: dict[str, Any] | None) -> dict[str, Any] | None:
+        if room is None:
+            return None
+        return {
+            "name": room.get("name") or "",
+            "display_price": room.get("display_price"),
+            "sold_out": bool(room.get("sold_out")),
+            "bookable": bool(room.get("bookable")),
+        }
+
+    priced = [room for room in rooms if isinstance(room.get("display_price"), (int, float))]
+    sellable = [room for room in priced if room.get("bookable")]
+    lowest_returned = min(priced, key=lambda room: room["display_price"]) if priced else None
+    lowest_sellable = min(sellable, key=lambda room: room["display_price"]) if sellable else None
+    return {
+        "sellable_count": sum(1 for room in rooms if room.get("bookable")),
+        "sold_out_count": sum(1 for room in rooms if room.get("sold_out")),
+        "all_sold_out": bool(rooms) and all(room.get("sold_out") for room in rooms),
+        "lowest_returned": pack(lowest_returned),
+        "lowest_sellable": pack(lowest_sellable),
+    }
+
+
+def match_requested_rooms(rooms: list[dict[str, Any]], requested: str) -> dict[str, Any]:
+    """按房型名称查找用户指定的一类房。没返回的名称不写成已满。"""
+    term = requested.strip()
+    matched = [room for room in rooms if term and term in str(room.get("name") or "")]
+    if not matched:
+        return {"requested": term, "status": "not_returned", "rooms": []}
+    if any(room.get("bookable") for room in matched):
+        return {"requested": term, "status": "sellable", "rooms": matched}
+    return {"requested": term, "status": "no_sellable", "rooms": matched}
 
 
 def _open_sort_key(hotel: dict[str, Any]) -> tuple:
@@ -384,11 +435,11 @@ def _rooms(args: argparse.Namespace) -> int:
     chain_id: object = int(args.chain_id) if str(args.chain_id).isdigit() else args.chain_id
     result = fetch_rooms_result(chain_id, args.check_in, args.check_out)
     status = result.get("status")
-    if status not in ("ok", "empty", "error"):
+    if status not in ("ok", "empty") and status not in _ROOM_LOOKUP_FAILURES:
         status = "error"
     public = [_room_record(room) for room in (result.get("rooms") or [])] if status == "ok" else []
     payload: dict[str, Any] = {
-        "ok": status != "error",
+        "ok": status in ("ok", "empty"),
         "rooms_status": status,
         "chain_id": chain_id,
         "check_in": args.check_in.isoformat(),
@@ -399,7 +450,9 @@ def _rooms(args: argparse.Namespace) -> int:
         "price_note": _ROOM_PRICE_NOTE,
         "rooms": public,
     }
-    if status == "error":
+    if status == "ok":
+        payload["room_summary"] = _room_summary(public)
+    if status not in ("ok", "empty"):
         payload["error"] = str(result.get("error") or "")
         return _emit(payload, 1)
     return _emit(payload, 0)

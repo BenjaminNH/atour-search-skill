@@ -260,6 +260,7 @@ class AtourSearchTests(unittest.TestCase):
         hotel_row = payload["hotels"][0]
         self.assertEqual(hotel_row["availability_from"], "rooms_error")
         self.assertEqual(hotel_row["rooms_error"], "房型接口超时")
+        self.assertEqual(hotel_row["rooms_error_status"], "error")
         self.assertFalse(hotel_row["available"])
         self.assertEqual(calls["enrich"], [[41]])
 
@@ -269,6 +270,7 @@ class AtourSearchTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(calls["rooms"], [])
         self.assertEqual(payload["hotels"][0]["availability_from"], "list")
+        self.assertEqual(payload["hotels"][0]["rooms_error_status"], "")
         self.assertFalse(payload["hotels"][0]["available"])
         self.assertEqual(payload["query"]["available_only"], False)
         self.assertEqual(calls["enrich"], [[51]])
@@ -398,9 +400,67 @@ class AtourSearchTests(unittest.TestCase):
         self.assertEqual(payload["rooms"][0]["name"], "高级大床房")
         self.assertEqual(payload["rooms"][0]["display_price"], 288)
         self.assertFalse(payload["rooms"][0]["sold_out"])
+        self.assertTrue(payload["rooms"][0]["bookable"])
         self.assertTrue(payload["rooms"][1]["sold_out"])
+        self.assertFalse(payload["rooms"][1]["bookable"])
+        self.assertEqual(payload["room_summary"]["lowest_sellable"]["name"], "高级大床房")
+        self.assertEqual(payload["room_summary"]["lowest_sellable"]["display_price"], 288)
         self.assertEqual(payload["chain_id"], 3301155)
         self.assertNotIn("access_hint", payload)
+
+    def test_blocked_rooms_exit_1_and_are_not_empty(self):
+        def blocked_fn(chain_id, start, end):
+            return {"status": "blocked", "rooms": [], "error": "查看的房型详情太多，暂时不能继续"}
+
+        code, payload, _calls = invoke(rooms_argv(), rooms_fn=blocked_fn)
+        self.assertEqual(code, 1)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["rooms_status"], "blocked")
+        self.assertEqual(payload["rooms"], [])
+        self.assertNotEqual(payload["rooms_status"], "empty")
+        self.assertNotIn("room_summary", payload)
+
+    def test_room_summary_keeps_sold_out_low_price_and_named_bed_types(self):
+        rooms = [
+            {"name": "低价双床房", "display_price": 280, "sold_out": True, "bookable": False},
+            {"name": "高级双床房", "display_price": 360, "sold_out": False, "bookable": True},
+            {"name": "大床房", "display_price": 300, "sold_out": True, "bookable": False},
+            {"name": "行政大床房", "display_price": 420, "sold_out": False, "bookable": True},
+        ]
+        summary = atour_search._room_summary(rooms)
+        self.assertEqual(summary["lowest_returned"]["name"], "低价双床房")
+        self.assertTrue(summary["lowest_returned"]["sold_out"])
+        self.assertFalse(summary["lowest_returned"]["bookable"])
+        self.assertEqual(summary["lowest_sellable"]["name"], "高级双床房")
+        self.assertEqual(summary["lowest_sellable"]["display_price"], 360)
+        self.assertFalse(summary["all_sold_out"])
+
+        same_bed = atour_search.match_requested_rooms(rooms, "双床")
+        self.assertEqual(same_bed["status"], "sellable")
+        self.assertEqual([room["name"] for room in same_bed["rooms"]], ["低价双床房", "高级双床房"])
+
+        other_bed = atour_search.match_requested_rooms(rooms, "大床")
+        self.assertEqual(other_bed["status"], "sellable")
+        self.assertEqual([room["name"] for room in other_bed["rooms"]], ["大床房", "行政大床房"])
+
+        only_full = atour_search.match_requested_rooms(
+            [rooms[0], {**rooms[1], "sold_out": True, "bookable": False}],
+            "双床",
+        )
+        self.assertEqual(only_full["status"], "no_sellable")
+        self.assertEqual(len(only_full["rooms"]), 2)
+
+        missing = atour_search.match_requested_rooms(rooms, "家庭房")
+        self.assertEqual(missing["status"], "not_returned")
+        self.assertEqual(missing["rooms"], [])
+
+        full_only = atour_search._room_summary([
+            {"name": "双床房", "display_price": 300, "sold_out": True, "bookable": False},
+        ])
+        self.assertTrue(full_only["all_sold_out"])
+        self.assertIsNone(full_only["lowest_sellable"])
+        self.assertEqual(full_only["lowest_returned"]["display_price"], 300)
+        self.assertFalse(full_only["lowest_returned"]["bookable"])
 
 
 if __name__ == "__main__":

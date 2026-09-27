@@ -43,6 +43,8 @@ ATOUR_TOKEN = ""
 _LIST_DELAY = (0.3, 0.5)
 _LIGHT_DELAY = (0.25, 0.6)
 _RETRY_BACKOFF = 1.5
+_QUOTE_ATTEMPTS = 3
+_QUOTE_BLOCKED = False
 
 
 def _request_delay() -> None:
@@ -215,13 +217,31 @@ def _fetch_open_date(chain_id: object, token: str) -> str:
     return "—"
 
 
+def _rooms_failure(status: str, error: str) -> dict[str, Any]:
+    return {"status": status, "rooms": [], "error": error}
+
+
+def _quote_http_status(resp: requests.Response) -> str | None:
+    code = getattr(resp, "status_code", 200) or 200
+    text = getattr(resp, "text", "") or ""
+    if code == 429:
+        return "rate_limited"
+    if code == 405 or (code != 200 and text.lstrip().startswith("<")):
+        return "blocked"
+    if code >= 400:
+        return "http_error"
+    return None
+
+
 def fetch_rooms_result(chain_id: object, start_date: date, end_date: date, token: str = ATOUR_TOKEN) -> dict[str, Any]:
     """按 chainId 取房型报价，并标明成功、空列表或失败。"""
+    global _QUOTE_BLOCKED
     key = (str(chain_id), str(start_date), str(end_date))
     if key in _ROOM_CACHE:
         rooms = _ROOM_CACHE[key]
         return {"status": "ok" if rooms else "empty", "rooms": rooms, "error": ""}
-    _request_delay_light()
+    if _QUOTE_BLOCKED:
+        return _rooms_failure("blocked", "查看的房型详情太多，暂时不能继续")
     params = {
         "platType": _PLAT_TYPE,
         "appVer": _APP_VER,
@@ -237,38 +257,62 @@ def fetch_rooms_result(chain_id: object, start_date: date, end_date: date, token
         "delegatorMebId": "",
         "corporationId": "",
     }
-    try:
-        resp = requests.post(_QUOTE_API, params=params, headers=_build_headers(token), json=body, timeout=15)
-        resp.raise_for_status()
-        payload = resp.json()
-    except requests.RequestException as exc:
-        return {"status": "error", "rooms": [], "error": f"房型接口请求失败：{exc}"}
-    if _success_rejected(payload):
-        code = payload.get("code")
-        msg = payload.get("msg_code") or payload.get("msg") or payload.get("message")
-        return {
-            "status": "error",
-            "rooms": [],
-            "error": f"房型接口返回错误：code={code} msg={msg}",
-        }
-    price_resp = (payload.get("result") or {}).get("priceResponse") or {}
-    raw_rooms = price_resp.get("chainRoomList", []) or []
-    out: list[dict[str, Any]] = []
-    for rm in raw_rooms:
-        info = rm.get("roomTypeInfoResponse") or {}
-        mp = rm.get("minRoomPrice") or {}
-        member = mp.get("showPrice")
-        out.append({
-            "房型": info.get("roomTypeName") or "",
-            "铂金会员价": float(member) if member is not None else None,
-            "门市价": float(mp.get("marketPrice")) if mp.get("marketPrice") is not None else None,
-            "早餐数": mp.get("breakFastNum"),
-            "取消政策": mp.get("cancelTips") or "",
-            "最少入住晚数": mp.get("minimumBookDays"),
-            "是否满房": "满房" if mp.get("isFullRoom") else "有房",
-        })
-    _ROOM_CACHE[key] = out
-    return {"status": "ok" if raw_rooms else "empty", "rooms": out, "error": ""}
+    failure: dict[str, Any] | None = None
+    for attempt in range(_QUOTE_ATTEMPTS):
+        if attempt:
+            time.sleep(_RETRY_BACKOFF * attempt)
+        else:
+            _request_delay_light()
+        try:
+            resp = requests.post(_QUOTE_API, params=params, headers=_build_headers(token), json=body, timeout=15)
+        except requests.Timeout:
+            failure = _rooms_failure("network_error", "房型报价请求超时")
+            continue
+        except requests.RequestException:
+            failure = _rooms_failure("network_error", "房型报价网络失败")
+            continue
+        http_status = _quote_http_status(resp)
+        if http_status == "blocked":
+            _QUOTE_BLOCKED = True
+            return _rooms_failure("blocked", "查看的房型详情太多，暂时不能继续")
+        if http_status == "rate_limited":
+            failure = _rooms_failure("rate_limited", "房型报价暂时过于频繁")
+            continue
+        if http_status == "http_error":
+            code = getattr(resp, "status_code", 0) or 0
+            failure = _rooms_failure("http_error", f"房型报价请求失败：HTTP {code}")
+            if code >= 500:
+                continue
+            return failure
+        try:
+            payload = resp.json()
+        except ValueError:
+            return _rooms_failure("http_error", "房型报价返回的不是房价数据")
+        if not isinstance(payload, dict):
+            return _rooms_failure("http_error", "房型报价返回的不是房价数据")
+        if _success_rejected(payload):
+            code = payload.get("code")
+            msg = payload.get("msg_code") or payload.get("msg") or payload.get("message")
+            return _rooms_failure("error", f"房型接口返回错误：code={code} msg={msg}")
+        price_resp = (payload.get("result") or {}).get("priceResponse") or {}
+        raw_rooms = price_resp.get("chainRoomList", []) or []
+        out: list[dict[str, Any]] = []
+        for rm in raw_rooms:
+            info = rm.get("roomTypeInfoResponse") or {}
+            mp = rm.get("minRoomPrice") or {}
+            member = mp.get("showPrice")
+            out.append({
+                "房型": info.get("roomTypeName") or "",
+                "铂金会员价": float(member) if member is not None else None,
+                "门市价": float(mp.get("marketPrice")) if mp.get("marketPrice") is not None else None,
+                "早餐数": mp.get("breakFastNum"),
+                "取消政策": mp.get("cancelTips") or "",
+                "最少入住晚数": mp.get("minimumBookDays"),
+                "是否满房": "满房" if mp.get("isFullRoom") else "有房",
+            })
+        _ROOM_CACHE[key] = out
+        return {"status": "ok" if raw_rooms else "empty", "rooms": out, "error": ""}
+    return failure or _rooms_failure("network_error", "房型报价网络失败")
 
 
 def get_hotel_rooms(chain_id: object, start_date: date, end_date: date, token: str = ATOUR_TOKEN) -> list[dict[str, Any]]:

@@ -60,8 +60,12 @@ python scripts/atour_search.py rooms --chain-id 3301155 --check-in 2026-10-01 --
 字段表见 [references/results.md](references/results.md)。读的时候按这些判断：
 
 - `--max-price` 比较 `display_price`，小于等于上限才留下。没有展示价的店不出现。`--brand` 和 `--exclude-brand` 都可以写多个品牌，跟在参数后面，或把参数重复写几次。只看时，命中其中任何一个就留下；排除时，命中其中任何一个就去掉。六个正式品牌名按相等匹配，「亚朵」和「亚朵S」要分别写。
-- `--available-only` 时，列表有房的店不再查房型。列表满房的店才查房型，房型也没有可售房才去掉。房型请求失败的店会留下，`availability_from` 为 `rooms_error`，向用户说明这次没确认成，不要说成已满房。
-- `rooms` 的 `rooms_status` 为 `empty` 时，请求成功但没有房型。为 `error` 时请求失败，退出码是 1，`ok` 为 false。网关拒绝时用上面的那句说明；其他失败也按「怎么跟用户说」说明，不要说成没房。
+- `--available-only` 时，列表有房的店不再查房型。列表满房的店才查房型，房型也没有可售房才去掉。房型请求失败的店会留下，`availability_from` 为 `rooms_error`，`rooms_error_status` 写明失败种类。向用户说明这次没确认成，不要说成已满房。
+- `rooms` 的 `rooms_status` 为 `empty` 时，请求成功但没有房型。`blocked` 和 `rate_limited` 用上面那句「查看的详情太多」。`http_error`、`network_error` 和 `error` 是没查成，退出码是 1，`ok` 为 false。这些都不要说成没房。
+- 房型结果保留每一间，包括已满的。`bookable` 为 false 时，`display_price` 只是满房时看到的价格，不能当成还能订的价格。`room_summary.lowest_returned` 是这次返回里最低的一间，它已满时说明名称和已满；`lowest_sellable` 是当前还能订的最低一间。两间都要说。用户问的是另一种床型时，只要这间低价房会让酒店起价被理解错，也要说。
+- 用户点名床型时，在房型名称里查找。找到的都已满，说该类房型当前无可售房。没有这个名称，说这次没有返回该房型，不要说它已满。
+- 列表里的 `display_price` 和 `available` 是酒店这一级。`--max-price` 比的是酒店起价。用户指定了房型、而这间的价格还没查到时，不能说它满足价格条件，也不能因为酒店显示有房就说这间有房。
+- 给用户说明时，先说日期、条件和有多少家已经能确认、有多少家还没确认。再按需要列出店名、位置、开业时间、可订房型和价格。低价房已满、价格还不是指定房型、暂时没查到，单独写出来。店多时说明还有多少家，不要把没展开的说成不符合条件。电话和长地址等用户问了再补。这是组织方式，不是固定模板。
 - 搜索里个别开业时间失败时，整次查询仍然成功。用每家的 `open_date_status` 区分：`missing` 是没有返回日期，`error` 是详情请求失败。
 - 地铁和到店路线先读响应里的 `access_hint`，再读 `address` 和 `access_note`。两处都是原文。程序不挑选站点或步行距离。原文没写地铁，只表示没提到。
 - `queried_at` 是这份 JSON 组装出来的时间。`display_price` 是当时的未登录展示价。

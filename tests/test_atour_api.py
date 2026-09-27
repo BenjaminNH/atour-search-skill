@@ -14,6 +14,7 @@ def _clear_caches() -> None:
     atour_api._OPEN_DATE_CACHE.clear()
     atour_api._PHONE_CACHE.clear()
     atour_api._ROOM_CACHE.clear()
+    atour_api._QUOTE_BLOCKED = False
 
 
 class _Response:
@@ -85,10 +86,23 @@ class ChainBaseTests(unittest.TestCase):
         self.assertNotIn("14", atour_api._CHAIN_BASE_CACHE)
 
 
+class _HttpResponse:
+    def __init__(self, status_code, text="", payload=None):
+        self.status_code = status_code
+        self.text = text
+        self._payload = payload
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+
 class RoomsResultTests(unittest.TestCase):
     def setUp(self):
         _clear_caches()
         patch.object(atour_api, "_request_delay_light").start()
+        self.sleep = patch.object(atour_api.time, "sleep").start()
         self.post = patch.object(atour_api.requests, "post").start()
         self.addCleanup(patch.stopall)
 
@@ -107,7 +121,11 @@ class RoomsResultTests(unittest.TestCase):
 
         self.post.side_effect = atour_api.requests.ConnectionError("reset")
         failed = atour_api.fetch_rooms_result(22, *stay)
-        self.assertEqual(failed["status"], "error")
+        self.assertEqual(failed["status"], "network_error")
+        self.assertEqual(failed["rooms"], [])
+        self.assertNotEqual(failed["status"], "empty")
+        self.assertEqual(self.post.call_count, 4)
+        self.assertEqual([item.args[0] for item in self.sleep.call_args_list], [1.5, 3.0])
         self.assertEqual(atour_api.get_hotel_rooms(22, *stay), [])
         self.assertNotIn(("22", str(stay[0]), str(stay[1])), atour_api._ROOM_CACHE)
         self.post.side_effect = None
@@ -134,6 +152,54 @@ class RoomsResultTests(unittest.TestCase):
         result = atour_api.fetch_rooms_result(23, date(2026, 9, 28), date(2026, 9, 29))
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["rooms"][0]["是否满房"], "满房")
+
+    def test_gateway_405_blocks_without_retry_or_cache(self):
+        stay = date(2026, 9, 28), date(2026, 9, 29)
+        self.post.return_value = _HttpResponse(405, "<html><title>405</title></html>")
+        blocked = atour_api.fetch_rooms_result(31, *stay)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(blocked["rooms"], [])
+        self.assertNotEqual(blocked["status"], "empty")
+        again = atour_api.fetch_rooms_result(32, *stay)
+        self.assertEqual(again["status"], "blocked")
+        self.assertEqual(self.post.call_count, 1)
+        self.assertEqual(self.sleep.call_count, 0)
+        self.assertNotIn(("31", str(stay[0]), str(stay[1])), atour_api._ROOM_CACHE)
+
+    def test_429_and_5xx_retry_then_stop(self):
+        stay = date(2026, 9, 28), date(2026, 9, 29)
+        self.post.return_value = _HttpResponse(429, "")
+        limited = atour_api.fetch_rooms_result(33, *stay)
+        self.assertEqual(limited["status"], "rate_limited")
+        self.assertEqual(limited["rooms"], [])
+        self.assertEqual(self.post.call_count, 3)
+        self.assertEqual([item.args[0] for item in self.sleep.call_args_list], [1.5, 3.0])
+        self.assertNotIn(("33", str(stay[0]), str(stay[1])), atour_api._ROOM_CACHE)
+
+        self.sleep.reset_mock()
+        self.post.return_value = _HttpResponse(503, "upstream")
+        server = atour_api.fetch_rooms_result(34, *stay)
+        self.assertEqual(server["status"], "http_error")
+        self.assertIn("HTTP 503", server["error"])
+        self.assertEqual(self.post.call_count, 6)
+        self.assertEqual([item.args[0] for item in self.sleep.call_args_list], [1.5, 3.0])
+
+    def test_timeout_is_network_error_and_client_4xx_is_not_retried(self):
+        stay = date(2026, 9, 28), date(2026, 9, 29)
+        self.post.side_effect = atour_api.requests.Timeout("slow")
+        timed_out = atour_api.fetch_rooms_result(35, *stay)
+        self.assertEqual(timed_out["status"], "network_error")
+        self.assertIn("超时", timed_out["error"])
+        self.assertEqual(timed_out["rooms"], [])
+        self.assertEqual(self.post.call_count, 3)
+        self.assertNotIn(("35", str(stay[0]), str(stay[1])), atour_api._ROOM_CACHE)
+
+        self.post.side_effect = None
+        self.post.return_value = _HttpResponse(404, "missing")
+        missing = atour_api.fetch_rooms_result(36, *stay)
+        self.assertEqual(missing["status"], "http_error")
+        self.assertEqual(self.post.call_count, 4)
+        self.assertNotIn(("36", str(stay[0]), str(stay[1])), atour_api._ROOM_CACHE)
 
 
 class NormalizeTests(unittest.TestCase):
